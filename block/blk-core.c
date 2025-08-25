@@ -52,6 +52,13 @@
 #include "blk-pm.h"
 #include "blk-cgroup.h"
 #include "blk-throttle.h"
+#include "blk-ioprio.h"
+
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+extern long bio_cnt;           // total bio sumbit
+extern long rt_bio_cnt;        // total rt bio sumbit, part of bio_cnt
+extern long ux_bio_cnt;        // total ux bio sumbit, part of rt_bio_cnt
+#endif
 
 struct dentry *blk_debugfs_root;
 
@@ -808,6 +815,29 @@ end_io:
 }
 EXPORT_SYMBOL(submit_bio_noacct);
 
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+extern bool test_task_ux(struct task_struct *task);
+#endif
+
+static void bio_set_ioprio(struct bio *bio)
+{
+	/* Nobody set ioprio so far? Initialize it based on task's nice value */
+	if (IOPRIO_PRIO_CLASS(bio->bi_ioprio) == IOPRIO_CLASS_NONE)
+		bio->bi_ioprio = get_current_ioprio();
+	blkcg_set_ioprio(bio);
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	bio_cnt++;
+
+	if (IOPRIO_PRIO_CLASS(bio->bi_ioprio) == IOPRIO_CLASS_RT) {
+		rt_bio_cnt++;
+	} else if (test_task_ux(current)) {
+		bio->bi_ioprio =  IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 4);
+		rt_bio_cnt++;
+		ux_bio_cnt++;
+	}
+#endif
+}
+
 /**
  * submit_bio - submit a bio to the block device layer for I/O
  * @bio: The &struct bio which describes the I/O
@@ -827,12 +857,16 @@ void submit_bio(struct bio *bio)
 		return;
 
 	if (bio_op(bio) == REQ_OP_READ) {
+		//#ifdef OPLUS_STORAGE_FS debug for bugid 7530538/7536896
+		BUG_ON(!bio->bi_iter.bi_size);
+		//#endif
 		task_io_account_read(bio->bi_iter.bi_size);
 		count_vm_events(PGPGIN, bio_sectors(bio));
 	} else if (bio_op(bio) == REQ_OP_WRITE) {
 		count_vm_events(PGPGOUT, bio_sectors(bio));
 	}
 
+	bio_set_ioprio(bio);
 	submit_bio_noacct(bio);
 }
 EXPORT_SYMBOL(submit_bio);
@@ -873,7 +907,16 @@ int bio_poll(struct bio *bio, struct io_comp_batch *iob, unsigned int flags)
 	 */
 	blk_flush_plug(current->plug, false);
 
-	if (bio_queue_enter(bio))
+	/*
+	 * We need to be able to enter a frozen queue, similar to how
+	 * timeouts also need to do that. If that is blocked, then we can
+	 * have pending IO when a queue freeze is started, and then the
+	 * wait for the freeze to finish will wait for polled requests to
+	 * timeout as the poller is preventer from entering the queue and
+	 * completing them. As long as we prevent new IO from being queued,
+	 * that should be all that matters.
+	 */
+	if (!percpu_ref_tryget(&q->q_usage_counter))
 		return 0;
 	if (queue_is_mq(q)) {
 		ret = blk_mq_poll(q, cookie, iob, flags);
@@ -933,10 +976,11 @@ void update_io_ticks(struct block_device *part, unsigned long now, bool end)
 	unsigned long stamp;
 again:
 	stamp = READ_ONCE(part->bd_stamp);
-	if (unlikely(time_after(now, stamp))) {
-		if (likely(try_cmpxchg(&part->bd_stamp, &stamp, now)))
-			__part_stat_add(part, io_ticks, end ? now - stamp : 1);
-	}
+	if (unlikely(time_after(now, stamp)) &&
+	    likely(try_cmpxchg(&part->bd_stamp, &stamp, now)) &&
+	    (end || part_in_flight(part)))
+		__part_stat_add(part, io_ticks, now - stamp);
+
 	if (part->bd_partno) {
 		part = bdev_whole(part);
 		goto again;
@@ -1193,6 +1237,9 @@ EXPORT_SYMBOL_GPL(blk_io_schedule);
 
 int __init blk_dev_init(void)
 {
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	const char *config = of_blk_feature_read("kblockd_ux_unbound_enable");
+#endif
 	BUILD_BUG_ON((__force u32)REQ_OP_LAST >= (1 << REQ_OP_BITS));
 	BUILD_BUG_ON(REQ_OP_BITS + REQ_FLAG_BITS > 8 *
 			sizeof_field(struct request, cmd_flags));
@@ -1202,6 +1249,12 @@ int __init blk_dev_init(void)
 			   __alignof__(struct request_queue)) !=
 		     sizeof(struct request_queue));
 
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	if (config && strcmp(config, "y") == 0)
+		kblockd_workqueue = alloc_workqueue("kblockd",
+					    WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_UX | WQ_UNBOUND, 0);
+	else
+#endif
 	/* used for unplugging and affects IO latency/throughput - HIGHPRI */
 	kblockd_workqueue = alloc_workqueue("kblockd",
 					    WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);

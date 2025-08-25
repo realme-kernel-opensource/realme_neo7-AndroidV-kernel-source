@@ -23,7 +23,7 @@
 #include <trace/events/f2fs.h>
 
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
-						bool tmp_ext)
+						bool tmp_ext, bool tmp_dot)
 {
 	size_t slen = strlen(s);
 	size_t sublen = strlen(sub);
@@ -49,11 +49,25 @@ static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 	for (i = 1; i < slen - sublen; i++) {
 		if (s[i] != '.')
 			continue;
-		if (!strncasecmp(s + i + 1, sub, sublen))
-			return true;
+		if (!strncasecmp(s + i + 1, sub, sublen)) {
+			if (!tmp_dot)
+				return true;
+			if (i == slen - sublen - 1 || s[i + 1 + sublen] == '.')
+				return true;
+		}
 	}
 
 	return false;
+}
+
+static inline bool is_temperature_extension(const unsigned char *s, const char *sub)
+{
+	return is_extension_exist(s, sub, true, false);
+}
+
+static inline bool is_compress_extension(const unsigned char *s, const char *sub)
+{
+	return is_extension_exist(s, sub, true, true);
 }
 
 int f2fs_update_extension_list(struct f2fs_sb_info *sbi, const char *name,
@@ -148,7 +162,7 @@ static void set_compress_new_inode(struct f2fs_sb_info *sbi, struct inode *dir,
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
 	for (i = cold_count; i < cold_count + hot_count; i++)
-		if (is_extension_exist(name, extlist[i], false))
+		if (is_temperature_extension(name, extlist[i]))
 			break;
 	f2fs_up_read(&sbi->sb_lock);
 	if (i < (cold_count + hot_count))
@@ -156,12 +170,12 @@ static void set_compress_new_inode(struct f2fs_sb_info *sbi, struct inode *dir,
 
 	/* Don't compress unallowed extension. */
 	for (i = 0; i < noext_cnt; i++)
-		if (is_extension_exist(name, noext[i], false))
+		if (is_compress_extension(name, noext[i]))
 			return;
 
 	/* Compress wanting extension. */
 	for (i = 0; i < ext_cnt; i++) {
-		if (is_extension_exist(name, ext[i], false)) {
+		if (is_compress_extension(name, ext[i])) {
 			set_compress_context(inode);
 			return;
 		}
@@ -189,17 +203,33 @@ static void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *inode,
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
 	for (i = 0; i < cold_count + hot_count; i++)
-		if (is_extension_exist(name, extlist[i], true))
+		if (is_temperature_extension(name, extlist[i]))
 			break;
 	f2fs_up_read(&sbi->sb_lock);
 
 	if (i == cold_count + hot_count)
 		return;
 
-	if (i < cold_count)
+	if (i < cold_count) {
 		file_set_cold(inode);
-	else
+		/* enable seqzone global, except cold files */
+#ifdef CONFIG_F2FS_SEQZONE
+		if (IS_ENCRYPTED(inode) && f2fs_sb_has_seqzone(sbi)) {
+			if (f2fs_inode_support_dedup(sbi, inode))
+				clear_inode_flag(inode, FI_SEQZONE);
+		}
+#endif
+	} else {
 		file_set_hot(inode);
+		/* disable seqzone global, still enable hot db files */
+#ifdef CONFIG_F2FS_SEQZONE
+		if (IS_ENCRYPTED(inode) && sbi->seq_zone == ENABLE_SEQZONE_HOT_FILES &&
+			!f2fs_compressed_file(inode) && f2fs_sb_has_seqzone(sbi)) {
+			if (f2fs_inode_support_dedup(sbi, inode))
+				set_inode_flag(inode, FI_SEQZONE);
+		}
+#endif
+	}
 }
 
 static struct inode *f2fs_new_inode(struct user_namespace *mnt_userns,
@@ -264,7 +294,10 @@ static struct inode *f2fs_new_inode(struct user_namespace *mnt_userns,
 
 	if (f2fs_sb_has_extra_attr(sbi)) {
 		set_inode_flag(inode, FI_EXTRA_ATTR);
-		F2FS_I(inode)->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+		if (sbi->oplus_feats & OPLUS_FEAT_DEDUP)
+			F2FS_I(inode)->i_extra_isize = F2FS_TOTAL_EXTRA_ATTR_SIZE;
+		else
+			F2FS_I(inode)->i_extra_isize = F2FS_LEGACY_EXTRA_ATTR_SIZE;
 	}
 
 	if (test_opt(sbi, INLINE_XATTR))
@@ -295,6 +328,15 @@ static struct inode *f2fs_new_inode(struct user_namespace *mnt_userns,
 
 	/* Check compression first. */
 	set_compress_new_inode(sbi, dir, inode, name);
+#ifdef CONFIG_F2FS_SEQZONE
+	/* enable seqzone global */
+	if (f2fs_sb_has_seqzone(sbi) && sbi->seq_zone == ENABLE_SEQZONE_EXCEPT_COLD
+			&& S_ISREG(inode->i_mode) &&
+			IS_ENCRYPTED(inode) && !f2fs_compressed_file(inode)) {
+		if (f2fs_inode_support_dedup(sbi, inode))
+			set_inode_flag(inode, FI_SEQZONE);
+	}
+#endif
 
 	/* Should enable inline_data after compression set */
 	if (test_opt(sbi, INLINE_DATA) && f2fs_may_inline_data(inode))
@@ -325,6 +367,7 @@ fail_drop:
 	trace_f2fs_new_inode(inode, err);
 	dquot_drop(inode);
 	inode->i_flags |= S_NOQUOTA;
+	make_bad_inode(inode);
 	if (nid_free)
 		set_inode_flag(inode, FI_FREE_NID);
 	clear_nlink(inode);
@@ -441,63 +484,6 @@ struct dentry *f2fs_get_parent(struct dentry *child)
 	return d_obtain_alias(f2fs_iget(child->d_sb, ino));
 }
 
-static int __recover_dot_dentries(struct inode *dir, nid_t pino)
-{
-	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
-	struct qstr dot = QSTR_INIT(".", 1);
-	struct qstr dotdot = QSTR_INIT("..", 2);
-	struct f2fs_dir_entry *de;
-	struct page *page;
-	int err = 0;
-
-	if (f2fs_readonly(sbi->sb)) {
-		f2fs_info(sbi, "skip recovering inline_dots inode (ino:%lu, pino:%u) in readonly mountpoint",
-			  dir->i_ino, pino);
-		return 0;
-	}
-
-	if (!S_ISDIR(dir->i_mode)) {
-		f2fs_err(sbi, "inconsistent inode status, skip recovering inline_dots inode (ino:%lu, i_mode:%u, pino:%u)",
-			  dir->i_ino, dir->i_mode, pino);
-		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		return -ENOTDIR;
-	}
-
-	err = f2fs_dquot_initialize(dir);
-	if (err)
-		return err;
-
-	f2fs_balance_fs(sbi, true);
-
-	f2fs_lock_op(sbi);
-
-	de = f2fs_find_entry(dir, &dot, &page);
-	if (de) {
-		f2fs_put_page(page, 0);
-	} else if (IS_ERR(page)) {
-		err = PTR_ERR(page);
-		goto out;
-	} else {
-		err = f2fs_do_add_link(dir, &dot, NULL, dir->i_ino, S_IFDIR);
-		if (err)
-			goto out;
-	}
-
-	de = f2fs_find_entry(dir, &dotdot, &page);
-	if (de)
-		f2fs_put_page(page, 0);
-	else if (IS_ERR(page))
-		err = PTR_ERR(page);
-	else
-		err = f2fs_do_add_link(dir, &dotdot, NULL, pino, S_IFDIR);
-out:
-	if (!err)
-		clear_inode_flag(dir, FI_INLINE_DOTS);
-
-	f2fs_unlock_op(sbi);
-	return err;
-}
-
 static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		unsigned int flags)
 {
@@ -507,7 +493,6 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 	struct dentry *new;
 	nid_t ino = -1;
 	int err = 0;
-	unsigned int root_ino = F2FS_ROOT_INO(F2FS_I_SB(dir));
 	struct f2fs_filename fname;
 
 	trace_f2fs_lookup_start(dir, dentry, flags);
@@ -544,17 +529,6 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		goto out;
 	}
 
-	if ((dir->i_ino == root_ino) && f2fs_has_inline_dots(dir)) {
-		err = __recover_dot_dentries(dir, root_ino);
-		if (err)
-			goto out_iput;
-	}
-
-	if (f2fs_has_inline_dots(inode)) {
-		err = __recover_dot_dentries(inode, dir->i_ino);
-		if (err)
-			goto out_iput;
-	}
 	if (IS_ENCRYPTED(dir) &&
 	    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
 	    !fscrypt_has_permitted_context(dir, inode)) {
@@ -1391,3 +1365,36 @@ const struct inode_operations f2fs_special_inode_operations = {
 	.set_acl	= f2fs_set_acl,
 	.listxattr	= f2fs_listxattr,
 };
+
+void f2fs_update_atime(struct inode *inode, bool oneshot)
+{
+#ifdef CONFIG_F2FS_FS_COMPRESSION_FIXED_OUTPUT
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+
+	if (!f2fs_compressed_file(inode))
+		return;
+
+	if (!sb_start_write_trylock(inode->i_sb))
+		return;
+
+	if (!inode_trylock(inode))
+		goto out_unlock_sb;
+
+	if (IS_RDONLY(inode))
+		goto out_unlock_inode;
+
+	if (fi->i_compress_flag & COMPRESS_ATIME_MASK) {
+		struct timespec64 now;
+
+		if (oneshot)
+			fi->i_compress_flag &= ~COMPRESS_ATIME_MASK;
+		now = current_time(inode);
+		inode_update_time(inode, &now, S_ATIME);
+	}
+
+out_unlock_inode:
+	inode_unlock(inode);
+out_unlock_sb:
+	sb_end_write(inode->i_sb);
+#endif
+}

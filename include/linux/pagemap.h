@@ -137,6 +137,8 @@ static inline bool mapping_empty(struct address_space *mapping)
 	return xa_empty(&mapping->i_pages);
 }
 
+extern void _trace_android_rvh_mapping_shrinkable(bool *shrinkable);
+
 /*
  * mapping_shrinkable - test if page cache state allows inode reclaim
  * @mapping: the page cache mapping
@@ -161,7 +163,11 @@ static inline bool mapping_empty(struct address_space *mapping)
 static inline bool mapping_shrinkable(struct address_space *mapping)
 {
 	void *head;
+	bool shrinkable = false;
 
+	_trace_android_rvh_mapping_shrinkable(&shrinkable);
+	if (shrinkable)
+		return true;
 	/*
 	 * On highmem systems, there could be lowmem pressure from the
 	 * inodes before there is highmem pressure from the page
@@ -1040,6 +1046,36 @@ static inline vm_fault_t folio_lock_or_retry(struct folio *folio,
 	return 0;
 }
 
+
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+static inline vm_fault_t lock_nr_folios_or_retry(struct folio **folio, struct vm_fault *vmf,
+		int nr)
+{
+	int i;
+	vm_fault_t ret = 0;
+
+	might_sleep();
+
+	for (i = 0; i < nr; i++) {
+		if (folio_trylock(folio[i]))
+			continue;
+
+		ret = __folio_lock_or_retry(folio[i], vmf);
+		if (ret)
+			break;
+	}
+
+	if (ret && i) {
+		for (i--; i >= 0; i--) {
+			CHP_BUG_ON(!folio_test_locked(folio[i]));
+			folio_unlock(folio[i]);
+		}
+		return ret;
+	}
+
+	return 0;
+}
+#endif
 /*
  * This is exported only for folio_wait_locked/folio_wait_writeback, etc.,
  * and should not be used directly.

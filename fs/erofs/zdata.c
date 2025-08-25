@@ -83,6 +83,9 @@ struct z_erofs_pcluster {
 	/* L: indicate several pageofs_outs or not */
 	bool multibases;
 
+	/* L: whether extra buffer allocations are best-effort */
+	bool besteffort;
+
 	/* A: compressed bvecs (can be cached or inplaced pages) */
 	struct z_erofs_bvec compressed_bvecs[];
 };
@@ -588,6 +591,7 @@ static void z_erofs_bind_cache(struct z_erofs_decompress_frontend *fe)
 			continue;
 
 		page = find_get_page(mc, pcl->obj.index + i);
+
 		if (page) {
 			t = (void *)((unsigned long)page | 1);
 			newpage = NULL;
@@ -607,6 +611,7 @@ static void z_erofs_bind_cache(struct z_erofs_decompress_frontend *fe)
 			set_page_private(newpage, Z_EROFS_PREALLOCATED_PAGE);
 			t = (void *)((unsigned long)newpage | 1);
 		}
+
 		spin_lock(&pcl->obj.lock);
 		if (!pcl->compressed_bvecs[i].page) {
 			pcl->compressed_bvecs[i].page = t;
@@ -972,7 +977,7 @@ static int z_erofs_read_fragment(struct super_block *sb, struct page *page,
 }
 
 static int z_erofs_do_read_page(struct z_erofs_decompress_frontend *fe,
-				struct page *page)
+				struct page *page, bool ra)
 {
 	struct inode *const inode = fe->inode;
 	struct erofs_map_blocks *const map = &fe->map;
@@ -1023,6 +1028,7 @@ repeat:
 		err = z_erofs_pcluster_begin(fe);
 		if (err)
 			goto out;
+		fe->pcl->besteffort |= !ra;
 	}
 
 	/*
@@ -1305,6 +1311,9 @@ static int z_erofs_decompress_pcluster(struct z_erofs_decompress_backend *be,
 					.inplace_io = overlapped,
 					.partial_decoding = pcl->partial,
 					.fillgaps = pcl->multibases,
+					.gfp = pcl->besteffort ?
+						GFP_KERNEL | __GFP_NOFAIL :
+						GFP_NOWAIT | __GFP_NORETRY
 				 }, be->pagepool);
 
 out:
@@ -1350,6 +1359,7 @@ out:
 	pcl->length = 0;
 	pcl->partial = true;
 	pcl->multibases = false;
+	pcl->besteffort = false;
 	pcl->bvset.nextpage = NULL;
 	pcl->vcnt = 0;
 
@@ -1423,6 +1433,7 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 				z_erofs_pcpu_workers[raw_smp_processor_id()]);
 		if (!worker) {
 			INIT_WORK(&io->u.work, z_erofs_decompressqueue_work);
+
 			queue_work(z_erofs_workqueue, &io->u.work);
 		} else {
 			kthread_queue_work(worker, &io->u.kthread_work);
@@ -1467,6 +1478,7 @@ repeat:
 		goto out_allocpage;
 
 	bvec->bv_page = page;
+
 	DBG_BUGON(z_erofs_is_shortlived_page(page));
 	/*
 	 * Handle preallocated cached pages.  We tried to allocate such pages
@@ -1608,7 +1620,6 @@ static void z_erofs_submissionqueue_endio(struct bio *bio)
 	blk_status_t err = bio->bi_status;
 	struct bio_vec *bvec;
 	struct bvec_iter_all iter_all;
-
 	bio_for_each_segment_all(bvec, bio, iter_all) {
 		struct page *page = bvec->bv_page;
 
@@ -1686,6 +1697,11 @@ static void z_erofs_submit_queue(struct z_erofs_decompress_frontend *f,
 			if (bio && (cur != last_pa ||
 				    last_bdev != mdev.m_bdev)) {
 submit_bio_retry:
+                                //#ifdef OPLUS_STORAGE_FS debug for bugid 7530538/7536896
+				if (!bio->bi_iter.bi_size)
+					WARN(1, "erofs submit empty io, bio=0x%p, bi_opf=0x%x, bi_sector=%llu\n",
+					     bio, bio->bi_opf, bio->bi_iter.bi_sector);
+                                //#endif
 				submit_bio(bio);
 				if (memstall) {
 					psi_memstall_leave(&pflags);
@@ -1714,7 +1730,11 @@ submit_bio_retry:
 
 			if (cur + bvec.bv_len > end)
 				bvec.bv_len = end - cur;
-			DBG_BUGON(bvec.bv_len < sb->s_blocksize);
+			//#ifdef OPLUS_STORAGE_FS debug for bugid 7530538/7536896.origin code is DBG_BUGON
+			BUG_ON(bvec.bv_len < sb->s_blocksize);
+			//#else
+			//DBG_BUGON(bvec.bv_len < sb->s_blocksize);
+			//#endif
 			if (!bio_add_page(bio, bvec.bv_page, bvec.bv_len,
 					  bvec.bv_offset))
 				goto submit_bio_retry;
@@ -1815,7 +1835,7 @@ static void z_erofs_pcluster_readmore(struct z_erofs_decompress_frontend *f,
 			if (PageUptodate(page)) {
 				unlock_page(page);
 			} else {
-				err = z_erofs_do_read_page(f, page);
+				err = z_erofs_do_read_page(f, page, !!rac);
 				if (err)
 					erofs_err(inode->i_sb,
 						  "readmore error at page %lu @ nid %llu",
@@ -1842,7 +1862,7 @@ static int z_erofs_read_folio(struct file *file, struct folio *folio)
 	f.headoffset = (erofs_off_t)page->index << PAGE_SHIFT;
 
 	z_erofs_pcluster_readmore(&f, NULL, true);
-	err = z_erofs_do_read_page(&f, page);
+	err = z_erofs_do_read_page(&f, page, false);
 	z_erofs_pcluster_readmore(&f, NULL, false);
 	z_erofs_pcluster_end(&f);
 
@@ -1883,7 +1903,7 @@ static void z_erofs_readahead(struct readahead_control *rac)
 		/* traversal in reverse order */
 		head = (void *)page_private(page);
 
-		err = z_erofs_do_read_page(&f, page);
+		err = z_erofs_do_read_page(&f, page, true);
 		if (err)
 			erofs_err(inode->i_sb,
 				  "readahead error at page %lu @ nid %llu",

@@ -43,11 +43,61 @@
 #include "blk-mq-sched.h"
 #include "blk-rq-qos.h"
 #include "blk-ioprio.h"
+#ifdef CONFIG_OPLUS_RESCTRL
+#include "../drivers/soc/oplus/oplus_resctrl/resctrl.h"
+#endif
+
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+#include <trace/hooks/sched.h>
+static bool block_graded_thread_enable = false;
+long bio_cnt = 0;           // total bio sumbit
+long rt_bio_cnt = 0;        // total rt bio sumbit, part of bio_cnt
+long ux_bio_cnt = 0;        // total ux bio sumbit, part of rt_bio_cnt
+static long rq_cnt = 0;            // total req sumbit
+static long rt_shed_rq = 0;        // total rt thread issue rq times
+static long rt_shed_rtrq = 0;      // total rt thread issue rt-rq times,  part of rt_shed_rq
+static long rt_shed = 0;           // total normal thread run times
+static long normal_shed = 0;        // queue rt-thread times
+static long need_normal_shed = 0;  // total queue normal-thread times
+static long need_rt_shed = 0;      // total queue rt-thread times
+static long cpu_dead = 0;          // total number of times ux/rt io cannot use rt threads
+module_param_named(block_graded_thread_enable, block_graded_thread_enable, bool, 0660);
+module_param_named(bio_cnt, bio_cnt, long, 0660);
+module_param_named(rt_bio_cnt, rt_bio_cnt, long, 0660);
+module_param_named(ux_bio_cnt, ux_bio_cnt, long, 0660);
+module_param_named(rq_cnt, rq_cnt, long, 0660);
+module_param_named(rt_shed_rq, rt_shed_rq, long, 0660);
+module_param_named(rt_shed_rtrq, rt_shed_rtrq, long, 0660);
+module_param_named(rt_shed, rt_shed, long, 0660);
+module_param_named(normal_shed, normal_shed, long, 0660);
+module_param_named(need_normal_shed, need_normal_shed, long, 0660);
+module_param_named(need_rt_shed, need_rt_shed, long, 0660);
+module_param_named(cpu_dead, cpu_dead, long, 0660);
+static struct kthread_worker **blk_workers;
+#endif
 
 static DEFINE_PER_CPU(struct llist_head, blk_cpu_done);
 
 static void blk_mq_poll_stats_start(struct request_queue *q);
 static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+
+#ifdef CONFIG_BLOCKIO_UX_OPT
+DEFINE_PER_CPU(__u32, block_ux_softirqs);
+unsigned long blk_send_ipi_counter = 0;
+extern bool should_queue_work_ux(struct bio *bio);
+void set_block_ux_softirqs(void)
+{
+}
+
+__u32 get_block_ux_softirqs(void)
+{
+	return 0;
+}
+
+void clear_block_ux_softirqs(void)
+{
+}
+#endif
 
 static int blk_mq_poll_stats_bkt(const struct request *rq)
 {
@@ -439,6 +489,7 @@ __blk_mq_alloc_requests_batch(struct blk_mq_alloc_data *data,
 
 static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
 {
+	void (*limit_depth)(blk_opf_t, struct blk_mq_alloc_data *) = NULL;
 	struct request_queue *q = data->q;
 	u64 alloc_time_ns = 0;
 	struct request *rq;
@@ -465,7 +516,7 @@ static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
 		    !blk_op_is_passthrough(data->cmd_flags) &&
 		    e->type->ops.limit_depth &&
 		    !(data->flags & BLK_MQ_REQ_RESERVED))
-			e->type->ops.limit_depth(data->cmd_flags, data);
+			limit_depth = e->type->ops.limit_depth;
 	}
 
 retry:
@@ -476,6 +527,9 @@ retry:
 
 	if (data->flags & BLK_MQ_REQ_RESERVED)
 		data->rq_flags |= RQF_RESV;
+
+	if (limit_depth)
+		limit_depth(data->cmd_flags, data);
 
 	/*
 	 * Try batched alloc if we want more than 1 tag.
@@ -675,6 +729,22 @@ out_queue_exit:
 }
 EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
 
+static void blk_mq_finish_request(struct request *rq)
+{
+	struct request_queue *q = rq->q;
+
+	if ((rq->rq_flags & RQF_ELVPRIV) &&
+	    q->elevator->type->ops.finish_request) {
+		q->elevator->type->ops.finish_request(rq);
+		/*
+		 * For postflush request that may need to be
+		 * completed twice, we should clear this flag
+		 * to avoid double finish_request() on the rq.
+		 */
+		rq->rq_flags &= ~RQF_ELVPRIV;
+	}
+}
+
 static void __blk_mq_free_request(struct request *rq)
 {
 	struct request_queue *q = rq->q;
@@ -701,9 +771,7 @@ void blk_mq_free_request(struct request *rq)
 {
 	struct request_queue *q = rq->q;
 
-	if ((rq->rq_flags & RQF_ELVPRIV) &&
-	    q->elevator->type->ops.finish_request)
-		q->elevator->type->ops.finish_request(rq);
+	blk_mq_finish_request(rq);
 
 	if (unlikely(laptop_mode && !blk_rq_is_passthrough(rq)))
 		laptop_io_completion(q->disk->bdi);
@@ -957,17 +1025,6 @@ bool blk_update_request(struct request *req, blk_status_t error,
 }
 EXPORT_SYMBOL_GPL(blk_update_request);
 
-static void __blk_account_io_done(struct request *req, u64 now)
-{
-	const int sgrp = op_stat_group(req_op(req));
-
-	part_stat_lock();
-	update_io_ticks(req->part, jiffies, true);
-	part_stat_inc(req->part, ios[sgrp]);
-	part_stat_add(req->part, nsecs[sgrp], now - req->start_time_ns);
-	part_stat_unlock();
-}
-
 static inline void blk_account_io_done(struct request *req, u64 now)
 {
 	/*
@@ -975,33 +1032,43 @@ static inline void blk_account_io_done(struct request *req, u64 now)
 	 * normal IO on queueing nor completion.  Accounting the
 	 * containing request is enough.
 	 */
+#ifdef CONFIG_OPLUS_RESCTRL
+	android_vh_blk_account_io_done_handler(NULL, req);
+#endif
 	if (blk_do_io_stat(req) && req->part &&
-	    !(req->rq_flags & RQF_FLUSH_SEQ))
-		__blk_account_io_done(req, now);
-}
+	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
+		const int sgrp = op_stat_group(req_op(req));
 
-static void __blk_account_io_start(struct request *rq)
-{
-	/*
-	 * All non-passthrough requests are created from a bio with one
-	 * exception: when a flush command that is part of a flush sequence
-	 * generated by the state machine in blk-flush.c is cloned onto the
-	 * lower device by dm-multipath we can get here without a bio.
-	 */
-	if (rq->bio)
-		rq->part = rq->bio->bi_bdev;
-	else
-		rq->part = rq->q->disk->part0;
-
-	part_stat_lock();
-	update_io_ticks(rq->part, jiffies, false);
-	part_stat_unlock();
+		part_stat_lock();
+		update_io_ticks(req->part, jiffies, true);
+		part_stat_inc(req->part, ios[sgrp]);
+		part_stat_add(req->part, nsecs[sgrp], now - req->start_time_ns);
+		part_stat_local_dec(req->part,
+				    in_flight[op_is_write(req_op(req))]);
+		part_stat_unlock();
+	}
 }
 
 static inline void blk_account_io_start(struct request *req)
 {
-	if (blk_do_io_stat(req))
-		__blk_account_io_start(req);
+	if (blk_do_io_stat(req)) {
+		/*
+		 * All non-passthrough requests are created from a bio with one
+		 * exception: when a flush command that is part of a flush sequence
+		 * generated by the state machine in blk-flush.c is cloned onto the
+		 * lower device by dm-multipath we can get here without a bio.
+		 */
+		if (req->bio)
+			req->part = req->bio->bi_bdev;
+		else
+			req->part = req->q->disk->part0;
+
+		part_stat_lock();
+		update_io_ticks(req->part, jiffies, false);
+		part_stat_local_inc(req->part,
+				    in_flight[op_is_write(req_op(req))]);
+		part_stat_unlock();
+	}
 }
 
 static inline void __blk_mq_end_request_acct(struct request *rq, u64 now)
@@ -1019,6 +1086,8 @@ inline void __blk_mq_end_request(struct request *rq, blk_status_t error)
 {
 	if (blk_mq_need_time_stamp(rq))
 		__blk_mq_end_request_acct(rq, ktime_get_ns());
+
+	blk_mq_finish_request(rq);
 
 	if (rq->end_io) {
 		rq_qos_done(rq->q, rq);
@@ -1074,6 +1143,8 @@ void blk_mq_end_request_batch(struct io_comp_batch *iob)
 		if (iob->need_ts)
 			__blk_mq_end_request_acct(rq, now);
 
+		blk_mq_finish_request(rq);
+
 		rq_qos_done(rq->q, rq);
 
 		/*
@@ -1126,6 +1197,18 @@ static int blk_softirq_cpu_dead(unsigned int cpu)
 
 static void __blk_mq_complete_request_remote(void *data)
 {
+#ifdef CONFIG_BLOCKIO_UX_OPT
+		struct request *rq = (struct request *)data;
+		struct bio *bio;
+
+		for (bio = rq->bio; bio; bio = bio->bi_next) {
+			if (should_queue_work_ux(bio)) {
+				set_block_ux_softirqs();
+				break;
+			}
+		}
+#endif
+
 	__raise_softirq_irqoff(BLOCK_SOFTIRQ);
 }
 
@@ -1145,10 +1228,11 @@ static inline bool blk_mq_complete_need_ipi(struct request *rq)
 	if (force_irqthreads())
 		return false;
 
-	/* same CPU or cache domain?  Complete locally */
+	/* same CPU or cache domain and capacity?  Complete locally */
 	if (cpu == rq->mq_ctx->cpu ||
 	    (!test_bit(QUEUE_FLAG_SAME_FORCE, &rq->q->queue_flags) &&
-	     cpus_share_cache(cpu, rq->mq_ctx->cpu)))
+	     cpus_share_cache(cpu, rq->mq_ctx->cpu) &&
+	     cpus_equal_capacity(cpu, rq->mq_ctx->cpu)))
 		return false;
 
 	/* don't try to IPI to an offline CPU */
@@ -1174,8 +1258,19 @@ static void blk_mq_raise_softirq(struct request *rq)
 
 	preempt_disable();
 	list = this_cpu_ptr(&blk_cpu_done);
-	if (llist_add(&rq->ipi_list, list))
+	if (llist_add(&rq->ipi_list, list)) {
+#ifdef CONFIG_BLOCKIO_UX_OPT
+		struct bio *bio;
+
+		for (bio = rq->bio; bio; bio = bio->bi_next) {
+			if (should_queue_work_ux(bio)) {
+				set_block_ux_softirqs();
+				break;
+			}
+		}
+#endif
 		raise_softirq(BLOCK_SOFTIRQ);
+	}
 	preempt_enable();
 }
 
@@ -1194,6 +1289,9 @@ bool blk_mq_complete_request_remote(struct request *rq)
 		return false;
 
 	if (blk_mq_complete_need_ipi(rq)) {
+#ifdef CONFIG_BLOCKIO_UX_OPT
+		blk_send_ipi_counter++;
+#endif
 		blk_mq_complete_send_ipi(rq);
 		return true;
 	}
@@ -1858,6 +1956,22 @@ static bool blk_mq_mark_tag_wait(struct blk_mq_hw_ctx *hctx,
 	__add_wait_queue(wq, wait);
 
 	/*
+	 * Add one explicit barrier since blk_mq_get_driver_tag() may
+	 * not imply barrier in case of failure.
+	 *
+	 * Order adding us to wait queue and allocating driver tag.
+	 *
+	 * The pair is the one implied in sbitmap_queue_wake_up() which
+	 * orders clearing sbitmap tag bits and waitqueue_active() in
+	 * __sbitmap_queue_wake_up(), since waitqueue_active() is lockless
+	 *
+	 * Otherwise, re-order of adding wait queue and getting driver tag
+	 * may cause __sbitmap_queue_wake_up() to wake up nothing because
+	 * the waitqueue_active() may not observe us in wait queue.
+	 */
+	smp_mb();
+
+	/*
 	 * It's possible that a tag was freed in the window between the
 	 * allocation failure and adding the hardware queue to the wait
 	 * queue.
@@ -2048,6 +2162,16 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
 		 */
 		if (nr_budgets)
 			nr_budgets--;
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+		rq_cnt++;
+
+		if (task_is_realtime(current)) {
+			rt_shed_rq++;
+			if (IOPRIO_PRIO_CLASS(rq->ioprio) == IOPRIO_CLASS_RT) {
+				rt_shed_rtrq++;
+			}
+		}
+#endif
 		ret = q->mq_ops->queue_rq(hctx, &bd);
 		switch (ret) {
 		case BLK_STS_OK:
@@ -2226,6 +2350,30 @@ select_cpu:
 	return next_cpu;
 }
 
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+extern void dm_bufio_shrink_scan_bypass(unsigned long task, bool *process);
+bool test_task_ux(struct task_struct *task)
+{
+	bool ux = false;
+	//TODO: use trace_android_vh_task_ux_op(task, 0, &ux)
+	dm_bufio_shrink_scan_bypass((unsigned long)task, &ux);
+
+	return ux;
+}
+
+static inline bool need_high_pri_worker(struct request_queue *q)
+{
+	if (unlikely(block_graded_thread_enable == false)) {
+		return false;
+	}
+
+	if (test_task_ux(current) || task_is_realtime(current)) {
+		return true;
+	} else
+		return false;
+}
+#endif
+
 /**
  * __blk_mq_delay_run_hw_queue - Run (or schedule to run) a hardware queue.
  * @hctx: Pointer to the hardware queue to run.
@@ -2238,6 +2386,10 @@ select_cpu:
 static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
 					unsigned long msecs)
 {
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	struct hctx_sched_entry *entry;
+	int cpu;
+#endif
 	if (unlikely(blk_mq_hctx_stopped(hctx)))
 		return;
 
@@ -2247,9 +2399,27 @@ static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
 			return;
 		}
 	}
-
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	if (hctx->android_kabi_reserved1 && need_high_pri_worker(hctx->queue)) {
+		need_rt_shed++;
+		entry = (struct hctx_sched_entry *)hctx->android_kabi_reserved1;
+		cpu = blk_mq_hctx_next_cpu(hctx);
+		if (unlikely(cpu == WORK_CPU_UNBOUND)) {
+			pr_info("hctx's cpu%d offine, still use kblockd", hctx->next_cpu);
+			cpu_dead++;
+			goto use_kblockd;
+		} else
+			kthread_mod_delayed_work(blk_workers[cpu],
+				&entry->dwork, msecs_to_jiffies(msecs));
+	} else {
+use_kblockd:
+		need_normal_shed++;
+#endif
 	kblockd_mod_delayed_work_on(blk_mq_hctx_next_cpu(hctx), &hctx->run_work,
 				    msecs_to_jiffies(msecs));
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	}
+#endif
 }
 
 /**
@@ -2440,6 +2610,12 @@ void blk_mq_start_stopped_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 		return;
 
 	clear_bit(BLK_MQ_S_STOPPED, &hctx->state);
+	/*
+	 * Pairs with the smp_mb() in blk_mq_hctx_stopped() to order the
+	 * clearing of BLK_MQ_S_STOPPED above and the checking of dispatch
+	 * list in the subsequent routine.
+	 */
+	smp_mb__after_atomic();
 	blk_mq_run_hw_queue(hctx, async);
 }
 EXPORT_SYMBOL_GPL(blk_mq_start_stopped_hw_queue);
@@ -2459,7 +2635,9 @@ static void blk_mq_run_work_fn(struct work_struct *work)
 	struct blk_mq_hw_ctx *hctx;
 
 	hctx = container_of(work, struct blk_mq_hw_ctx, run_work.work);
-
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	normal_shed++;
+#endif
 	/*
 	 * If we are stopped, don't run the queue.
 	 */
@@ -2468,6 +2646,25 @@ static void blk_mq_run_work_fn(struct work_struct *work)
 
 	__blk_mq_run_hw_queue(hctx);
 }
+
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+static void blk_mq_thread_work(struct kthread_work *work)
+{
+	struct hctx_sched_entry *entry;
+
+	current->flags |= PF_MEMALLOC_NOIO;
+	entry = container_of(work, struct hctx_sched_entry, dwork.work);
+	rt_shed++;
+	/*
+	 * If we are stopped, don't run the queue.
+	 */
+	if (blk_mq_hctx_stopped(entry->hctx))
+		return;
+
+	__blk_mq_run_hw_queue(entry->hctx);
+
+}
+#endif
 
 static inline void __blk_mq_insert_req_list(struct blk_mq_hw_ctx *hctx,
 					    struct request *rq,
@@ -2913,14 +3110,6 @@ static bool blk_mq_can_use_cached_rq(struct request *rq, struct blk_plug *plug,
 	return true;
 }
 
-static void bio_set_ioprio(struct bio *bio)
-{
-	/* Nobody set ioprio so far? Initialize it based on task's nice value */
-	if (IOPRIO_PRIO_CLASS(bio->bi_ioprio) == IOPRIO_CLASS_NONE)
-		bio->bi_ioprio = get_current_ioprio();
-	blkcg_set_ioprio(bio);
-}
-
 /**
  * blk_mq_submit_bio - Create and send a request to block device.
  * @bio: Bio pointer.
@@ -2944,7 +3133,6 @@ void blk_mq_submit_bio(struct bio *bio)
 	blk_status_t ret;
 
 	bio = blk_queue_bounce(bio, q);
-	bio_set_ioprio(bio);
 
 	if (plug) {
 		rq = rq_list_peek(&plug->cached_rq);
@@ -3637,18 +3825,17 @@ static int blk_mq_init_hctx(struct request_queue *q,
 		struct blk_mq_tag_set *set,
 		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
 {
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	struct hctx_sched_entry *entry =
+			(struct hctx_sched_entry *)hctx->android_kabi_reserved1;
+#endif
 	hctx->queue_num = hctx_idx;
-
-	if (!(hctx->flags & BLK_MQ_F_STACKING))
-		cpuhp_state_add_instance_nocalls(CPUHP_AP_BLK_MQ_ONLINE,
-				&hctx->cpuhp_online);
-	cpuhp_state_add_instance_nocalls(CPUHP_BLK_MQ_DEAD, &hctx->cpuhp_dead);
 
 	hctx->tags = set->tags[hctx_idx];
 
 	if (set->ops->init_hctx &&
 	    set->ops->init_hctx(hctx, set->driver_data, hctx_idx))
-		goto unregister_cpu_notifier;
+		goto fail;
 
 	if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx,
 				hctx->numa_node))
@@ -3656,6 +3843,17 @@ static int blk_mq_init_hctx(struct request_queue *q,
 
 	if (xa_insert(&q->hctx_table, hctx_idx, hctx, GFP_KERNEL))
 		goto exit_flush_rq;
+
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	if (entry) {
+		entry->hctx = hctx;
+		kthread_init_delayed_work(&entry->dwork, blk_mq_thread_work);
+	}
+#endif
+	if (!(hctx->flags & BLK_MQ_F_STACKING))
+		cpuhp_state_add_instance_nocalls(CPUHP_AP_BLK_MQ_ONLINE,
+				&hctx->cpuhp_online);
+	cpuhp_state_add_instance_nocalls(CPUHP_BLK_MQ_DEAD, &hctx->cpuhp_dead);
 
 	return 0;
 
@@ -3665,8 +3863,7 @@ static int blk_mq_init_hctx(struct request_queue *q,
  exit_hctx:
 	if (set->ops->exit_hctx)
 		set->ops->exit_hctx(hctx, hctx_idx);
- unregister_cpu_notifier:
-	blk_mq_remove_cpuhp(hctx);
+ fail:
 	return -1;
 }
 
@@ -3721,8 +3918,21 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
 
 	blk_mq_hctx_kobj_init(hctx);
 
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	if (set->nr_hw_queues > 1) {
+		hctx->android_kabi_reserved1 =
+                            (u64)kzalloc_node(sizeof(struct hctx_sched_entry),
+                                   gfp, hctx->numa_node);
+		if (!hctx->android_kabi_reserved1)
+			goto free_fq;
+	}
+#endif
 	return hctx;
-
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+ free_fq:
+	kfree(&hctx->fq->flush_rq);
+	kfree(&hctx->fq);
+#endif
  free_bitmap:
 	sbitmap_free(&hctx->ctx_map);
  free_ctxs:
@@ -4952,17 +5162,62 @@ void blk_mq_cancel_work_sync(struct request_queue *q)
 
 		cancel_delayed_work_sync(&q->requeue_work);
 
-		queue_for_each_hw_ctx(q, hctx, i)
+		queue_for_each_hw_ctx(q, hctx, i) {
 			cancel_delayed_work_sync(&hctx->run_work);
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+			if (hctx->android_kabi_reserved1) {
+				struct hctx_sched_entry *entry =
+					(struct hctx_sched_entry *)hctx->android_kabi_reserved1;
+				kthread_cancel_delayed_work_sync(&entry->dwork);
+			}
+#endif
+		}
 	}
 }
 
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+const char *of_blk_feature_read(char *name)
+{
+	const char *value = NULL;
+
+	if (name) {
+		struct device_node *np = of_find_node_opts_by_path(BLK_MQ_DTS_PATH, NULL);
+		if (np) {
+			of_property_read_string(np, name, &value);
+		}
+	}
+
+	return value;
+}
+#endif
 static int __init blk_mq_init(void)
 {
 	int i;
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+	const char *config = of_blk_feature_read("block_graded_thread_enable");
+	if (config && strcmp(config, "y") == 0)
+		block_graded_thread_enable = true;
+	else
+		block_graded_thread_enable = false;
 
-	for_each_possible_cpu(i)
+	blk_workers = kmalloc(num_possible_cpus() * sizeof(struct kthread_worker *),GFP_KERNEL);
+	if (!blk_workers) {
+		pr_err("malloc blk_workers fail\n");
+		return -ENOMEM;
+	}
+#endif
+
+	for_each_possible_cpu(i) {
 		init_llist_head(&per_cpu(blk_cpu_done, i));
+#ifdef CONFIG_BLK_MQ_USE_LOCAL_THREAD
+		blk_workers[i] = kthread_create_worker_on_cpu(i, 0, "blk_run_queue%d", i);
+		if (IS_ERR(blk_workers[i])) {
+			pr_err("create blk_workers[%d] fail\n",i);
+			return -ENOMEM;
+		}
+		sched_set_fifo_low(blk_workers[i]->task);
+#endif
+	}
 	open_softirq(BLOCK_SOFTIRQ, blk_done_softirq);
 
 	cpuhp_setup_state_nocalls(CPUHP_BLOCK_SOFTIRQ_DEAD,

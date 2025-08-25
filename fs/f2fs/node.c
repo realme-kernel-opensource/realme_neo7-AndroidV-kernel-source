@@ -753,6 +753,38 @@ got:
 	return level;
 }
 
+#ifdef CONFIG_F2FS_SEQZONE
+u32 seqzone_index(struct inode *inode,
+			struct page *node_page, unsigned int offset)
+{
+	struct f2fs_node *raw_node;
+	__le32 *addr_array;
+	int base = 0;
+	bool is_inode = IS_INODE(node_page);
+	int addrs = DEF_ADDRS_PER_BLOCK / 2;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	raw_node = F2FS_NODE(node_page);
+
+	if (is_inode) {
+		int xattr_addrs = 0;
+		if (f2fs_sb_has_flexible_inline_xattr(sbi))
+			xattr_addrs = le16_to_cpu(raw_node->i.i_inline_xattr_size);
+		else if (raw_node->i.i_inline & F2FS_INLINE_XATTR)
+			xattr_addrs = DEFAULT_INLINE_XATTR_ADDRS;
+
+		if (!inode)
+			/* from GC path only */
+			base = offset_in_addr(&raw_node->i);
+		else if (f2fs_has_extra_attr(inode))
+			base = get_extra_isize(inode);
+		addrs = (DEF_ADDRS_PER_INODE - base - xattr_addrs) / 2;
+	}
+
+	addr_array = blkaddr_in_node(raw_node);
+	return le32_to_cpu(addr_array[base + offset + addrs]);
+}
+#endif
+
 /*
  * Caller should call f2fs_put_dnode(dn).
  * Also, it should grab and release a rwsem by calling f2fs_lock_op() and
@@ -852,22 +884,35 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 
 	if (is_inode_flag_set(dn->inode, FI_COMPRESSED_FILE) &&
 					f2fs_sb_has_readonly(sbi)) {
-		unsigned int c_len = f2fs_cluster_blocks_are_contiguous(dn);
+		unsigned int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+		unsigned int ofs_in_node = dn->ofs_in_node;
+		pgoff_t fofs = index;
+		unsigned int c_len;
 		block_t blkaddr;
 
+		/* should align fofs and ofs_in_node to cluster_size */
+		if (fofs % cluster_size) {
+			fofs = round_down(fofs, cluster_size);
+			ofs_in_node = round_down(ofs_in_node, cluster_size);
+		}
+
+		c_len = f2fs_cluster_blocks_are_contiguous(dn, ofs_in_node);
 		if (!c_len)
 			goto out;
 
-		blkaddr = f2fs_data_blkaddr(dn);
+		blkaddr = data_blkaddr(dn->inode, dn->node_page, ofs_in_node);
 		if (blkaddr == COMPRESS_ADDR)
 			blkaddr = data_blkaddr(dn->inode, dn->node_page,
-						dn->ofs_in_node + 1);
+						ofs_in_node + 1);
 
 		f2fs_update_read_extent_tree_range_compressed(dn->inode,
-					index, blkaddr,
-					F2FS_I(dn->inode)->i_cluster_size,
-					c_len);
+					fofs, blkaddr, cluster_size, c_len);
 	}
+#ifdef CONFIG_F2FS_SEQZONE
+	if (f2fs_seqzone_file(dn->inode))
+		dn->seqzone_index = seqzone_index(dn->inode,
+					dn->node_page, dn->ofs_in_node);
+#endif
 out:
 	return 0;
 
@@ -898,7 +943,7 @@ static int truncate_node(struct dnode_of_data *dn)
 		return err;
 
 	/* Deallocate node address */
-	f2fs_invalidate_blocks(sbi, ni.blk_addr);
+	f2fs_invalidate_blocks(sbi, ni.blk_addr, 1);
 	dec_valid_node_count(sbi, dn->inode, dn->nid == dn->inode->i_ino);
 	set_node_addr(sbi, &ni, NULL_ADDR, false);
 
@@ -1301,6 +1346,7 @@ struct page *f2fs_new_node_page(struct dnode_of_data *dn, unsigned int ofs)
 	}
 	if (unlikely(new_ni.blk_addr != NULL_ADDR)) {
 		err = -EFSCORRUPTED;
+		dec_valid_node_count(sbi, dn->inode, !ofs);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
 		f2fs_handle_error(sbi, ERROR_INVALID_BLKADDR);
 		goto fail;
@@ -1327,7 +1373,6 @@ struct page *f2fs_new_node_page(struct dnode_of_data *dn, unsigned int ofs)
 	if (ofs == 0)
 		inc_valid_inode_count(sbi);
 	return page;
-
 fail:
 	clear_node_page_dirty(page);
 	f2fs_put_page(page, 1);
@@ -2715,7 +2760,7 @@ int f2fs_recover_xattr_data(struct inode *inode, struct page *page)
 	if (err)
 		return err;
 
-	f2fs_invalidate_blocks(sbi, ni.blk_addr);
+	f2fs_invalidate_blocks(sbi, ni.blk_addr, 1);
 	dec_valid_node_count(sbi, inode, false);
 	set_node_addr(sbi, &ni, NULL_ADDR, false);
 

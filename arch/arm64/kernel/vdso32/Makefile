@@ -3,6 +3,8 @@
 # Makefile for vdso32
 #
 
+PGO_PROFILE := n
+
 # Absolute relocation type $(ARCH_REL_TYPE_ABS) needs to be defined before
 # the inclusion of generic Makefile.
 ARCH_REL_TYPE_ABS := R_ARM_JUMP_SLOT|R_ARM_GLOB_DAT|R_ARM_ABS32
@@ -68,11 +70,9 @@ VDSO_CFLAGS += -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
                -fno-strict-aliasing -fno-common \
                -Werror-implicit-function-declaration \
                -Wno-format-security \
-               -Wdeclaration-after-statement \
                -std=gnu11
 VDSO_CFLAGS  += -O2
 # Some useful compiler-dependent flags from top-level Makefile
-VDSO_CFLAGS += $(call cc32-option,-Wdeclaration-after-statement,)
 VDSO_CFLAGS += $(call cc32-option,-Wno-pointer-sign)
 VDSO_CFLAGS += -fno-strict-overflow
 VDSO_CFLAGS += $(call cc32-option,-Werror=strict-prototypes)
@@ -105,6 +105,10 @@ VDSO_LDFLAGS += -Bsymbolic --no-undefined -soname=linux-vdso.so.1
 VDSO_LDFLAGS += -z max-page-size=4096 -z common-page-size=4096
 VDSO_LDFLAGS += -shared --hash-style=sysv --build-id=sha1
 VDSO_LDFLAGS += --orphan-handling=warn
+
+# Add user-supplied KCPPFLAGS_COMPAT as the last assignments
+VDSO_CFLAGS += $(KCPPFLAGS_COMPAT)
+VDSO_AFLAGS += $(KCPPFLAGS_COMPAT)
 
 
 # Borrow vdsomunge.c from the arm vDSO

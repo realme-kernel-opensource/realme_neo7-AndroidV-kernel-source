@@ -9,6 +9,14 @@
 #
 source "arch/$(SRCARCH)/Kconfig"
 
+config ARCH_CONFIGURES_CPU_MITIGATIONS
+	bool
+
+if !ARCH_CONFIGURES_CPU_MITIGATIONS
+config CPU_MITIGATIONS
+	def_bool y
+endif
+
 menu "General architecture-dependent options"
 
 config CRASH_CORE
@@ -642,6 +650,7 @@ config SHADOW_CALL_STACK
 	bool "Shadow Call Stack"
 	depends on ARCH_SUPPORTS_SHADOW_CALL_STACK
 	depends on DYNAMIC_FTRACE_WITH_ARGS || DYNAMIC_FTRACE_WITH_REGS || !FUNCTION_GRAPH_TRACER
+	depends on MMU
 	help
 	  This option enables the compiler's Shadow Call Stack, which
 	  uses a shadow stack to protect function return addresses from
@@ -1439,6 +1448,10 @@ config ARCH_HAS_NONLEAF_PMD_YOUNG
 	  accessed bit in non-leaf PMD entries when using them as part of linear
 	  address translations. Page table walkers that clear the accessed bit
 	  may use this capability to reduce their search space.
+
+config ARCH_SUPPORTS_PGO_CLANG
+	bool "PGO support"
+	default n
 
 source "kernel/gcov/Kconfig"
 

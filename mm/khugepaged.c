@@ -55,6 +55,7 @@ enum scan_result {
 	SCAN_CGROUP_CHARGE_FAIL,
 	SCAN_TRUNCATED,
 	SCAN_PAGE_HAS_PRIVATE,
+	SCAN_STORE_FAILED,
 };
 
 #define CREATE_TRACE_POINTS
@@ -362,6 +363,9 @@ int hugepage_madvise(struct vm_area_struct *vma,
 		 */
 		if (mm_has_pgste(vma->vm_mm))
 			return 0;
+#endif
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		return 0;
 #endif
 		*vm_flags &= ~VM_NOHUGEPAGE;
 		*vm_flags |= VM_HUGEPAGE;
@@ -803,7 +807,11 @@ static int hpage_collapse_find_target_node(struct collapse_control *cc)
 static bool hpage_collapse_alloc_page(struct page **hpage, gfp_t gfp, int node,
 				      nodemask_t *nmask)
 {
+#ifndef CONFIG_CONT_PTE_HUGEPAGE
 	*hpage = __alloc_pages(gfp, HPAGE_PMD_ORDER, node, nmask);
+#else
+	*hpage = NULL;
+#endif
 	if (unlikely(!*hpage)) {
 		count_vm_event(THP_COLLAPSE_ALLOC_FAILED);
 		return false;
@@ -1851,6 +1859,15 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 					goto xa_locked;
 				}
 				xas_store(&xas, hpage);
+				if (xas_error(&xas)) {
+					/* revert shmem_charge performed
+					 * in the previous condition
+					 */
+					mapping->nrpages--;
+					shmem_uncharge(mapping->host, 1);
+					result = SCAN_STORE_FAILED;
+					goto xa_locked;
+				}
 				nr_none++;
 				continue;
 			}
@@ -2002,6 +2019,11 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 
 		/* Finally, replace with the new page. */
 		xas_store(&xas, hpage);
+		/* We can't get an ENOMEM here (because the allocation happened before)
+		 * but let's check for errors (XArray implementation can be
+		 * changed in the future)
+		 */
+		WARN_ON_ONCE(xas_error(&xas));
 		continue;
 out_unlock:
 		unlock_page(page);
@@ -2039,6 +2061,11 @@ out_unlock:
 	/* Join all the small entries into a single multi-index entry */
 	xas_set_order(&xas, start, HPAGE_PMD_ORDER);
 	xas_store(&xas, hpage);
+	/* Here we can't get an ENOMEM (because entries were
+	 * previously allocated) But let's check for errors
+	 * (XArray implementation can be changed in the future)
+	 */
+	WARN_ON_ONCE(xas_error(&xas));
 xa_locked:
 	xas_unlock_irq(&xas);
 xa_unlocked:
@@ -2651,6 +2678,10 @@ int madvise_collapse(struct vm_area_struct *vma, struct vm_area_struct **prev,
 	BUG_ON(vma->vm_end < end);
 
 	*prev = vma;
+
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	return -EINVAL;
+#endif
 
 	if (!hugepage_vma_check(vma, vma->vm_flags, false, false, false))
 		return -EINVAL;
